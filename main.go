@@ -11,16 +11,18 @@ import (
 	"net/url"
 	"os"
 
+	"github.com/garyburd/redigo/redis"
 	"github.com/upamune/amazing"
 )
 
 type service struct {
 	client   *amazing.Amazing
 	cacheDir string
+	redisURL string
 }
 
 func main() {
-	var port, cacheDir string
+	var port, cacheDir, redisURL string
 	var awsAccess, awsSecret, awsTag, awsDomain string
 
 	flag.StringVar(&awsAccess, "access", "", "aws access id")
@@ -29,6 +31,7 @@ func main() {
 	flag.StringVar(&awsDomain, "domain", "JP", "amazon domain")
 	flag.StringVar(&port, "port", "8080", "port number")
 	flag.StringVar(&cacheDir, "cache-dir", "", "for json cache")
+	flag.StringVar(&redisURL, "redis-url", "", "url of redis server")
 	flag.Parse()
 
 	client, err := amazing.NewAmazing(awsDomain, awsTag, awsAccess, awsSecret)
@@ -39,6 +42,7 @@ func main() {
 	service := &service{
 		client:   client,
 		cacheDir: cacheDir,
+		redisURL: redisURL,
 	}
 	http.HandleFunc("/hc", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -68,7 +72,7 @@ type Item struct {
 
 var ErrNotFoundFile = errors.New("file not found")
 
-func (s *service) getItemFromCache(itemID string) ([]byte, error) {
+func (s *service) getItemFromCacheFile(itemID string) ([]byte, error) {
 	filename := s.getFileName(itemID)
 
 	b, err := ioutil.ReadFile(filename)
@@ -83,13 +87,78 @@ func (s *service) getFileName(itemID string) string {
 	return fmt.Sprintf("%s/%s", s.cacheDir, itemID)
 }
 
-func (s *service) saveItemToCache(item *Item) error {
+func (s *service) saveItemToCacheFile(item *Item) error {
 	f, err := os.OpenFile(s.getFileName(item.ASIN), os.O_WRONLY|os.O_CREATE, 0644)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 	return json.NewEncoder(f).Encode(item)
+}
+
+func (s *service) getItemFromRedis(itemID string) ([]byte, error) {
+	c, err := redis.DialURL(s.redisURL)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+
+	e, err := redis.Bool(c.Do("EXISTS", itemID))
+	if err != nil {
+		return nil, err
+	}
+
+	if e == true {
+		b, err := redis.Bytes(c.Do("GET", itemID))
+		if err != nil {
+			return nil, err
+		}
+		return b, nil
+	}
+	return nil, nil
+}
+
+func (s *service) saveItemToRedis(item *Item) error {
+	c, err := redis.DialURL(s.redisURL)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	b, err := json.Marshal(item)
+	if err != nil {
+		return err
+	}
+
+	_, err = c.Do("SET", item.ASIN, b)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *service) getFromCache(itemID string) ([]byte, error) {
+	if s.redisURL != "" {
+		json, err := s.getItemFromRedis(itemID)
+		return json, err
+	}
+
+	if s.cacheDir != "" {
+		json, err := s.getItemFromCacheFile(itemID)
+		return json, err
+	}
+	return nil, nil
+}
+
+func (s *service) saveToCache(item *Item) error {
+	if s.redisURL != "" {
+		return s.saveItemToRedis(item)
+	}
+
+	if s.cacheDir != "" {
+		return s.saveItemToCacheFile(item)
+	}
+	return nil
 }
 
 func (s *service) amazonHandler(w http.ResponseWriter, req *http.Request) {
@@ -107,19 +176,19 @@ func (s *service) amazonHandler(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// キャッシュされていたらキャッシュを返す
-	if s.cacheDir != "" {
-		json, err := s.getItemFromCache(itemID)
-		if err != nil {
-			if err != ErrNotFoundFile {
-				log.Printf("failed get a cache: %s", err)
-			}
-		} else {
-			// キャッシュが見つかった時
-			w.Header().Set("Content-Type", "application/json")
-			w.Write(json)
-			log.Printf("hit cache: %s", itemID)
-			return
+	cache, err := s.getFromCache(itemID)
+	if err != nil {
+		if err != ErrNotFoundFile {
+			log.Printf("failed get a cache: %s", err)
 		}
+	}
+
+	// キャッシュが見つかった時
+	if cache != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(cache)
+		log.Printf("hit cache: %s", itemID)
+		return
 	}
 
 	params := url.Values{
@@ -151,10 +220,8 @@ func (s *service) amazonHandler(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// キャッシュする
-	if s.cacheDir != "" {
-		if err := s.saveItemToCache(item); err != nil {
-			log.Printf("failed to save a cache: %v", err)
-		}
+	if s.saveToCache(item); err != nil {
+		log.Printf("failed to save a cache: %v", err)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
